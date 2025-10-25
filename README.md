@@ -120,7 +120,8 @@ npm test
 * Consider monitoring tools (logs, metrics) for production workflows.
 
 ## 🤝 Contributing
-
+> (Major Appreciation for the idea youtube.com/@AttentionAndrew)
+> ---
 Contributions are welcome! If you’d like to suggest a feature or fix a bug:
 
 * Fork this repo
