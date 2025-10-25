@@ -20,7 +20,7 @@ const HF_MODEL = "google/flan-t5-base"; // Free tier model
 //const HF_MODEL = "HuggingFaceH4/zephyr-7b-beta";
 //const HF_MODEL = "google/flan-t5-base";
 
-const HF_API_KEY = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY || "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";
+const HF_API_KEY = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY || "";
 
 async function callHuggingFaceAPI(prompt: string): Promise<string> {
   try {
