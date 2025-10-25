@@ -1,0 +1,423 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import {
+  insertProjectSchema,
+  updateProjectSchema,
+  insertTaskSchema,
+  updateTaskSchema,
+  updateSettingsSchema,
+  aiGoalBreakdownRequestSchema,
+  type AIGoalBreakdownResponse,
+} from "@shared/schema";
+import { ZodError } from "zod";
+
+// Hugging Face API configuration
+// Force mock mode for demo - remove this line when you have a working API
+const USE_MOCK_AI = true; // Set to false when you have working API key
+const HF_API_URL = "https://api-inference.huggingface.co/models/";
+const HF_MODEL = "google/flan-t5-base"; // Free tier model
+//const HF_MODEL = "HuggingFaceH4/zephyr-7b-beta";
+//const HF_MODEL = "google/flan-t5-base";
+
+const HF_API_KEY = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY || "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";
+
+async function callHuggingFaceAPI(prompt: string): Promise<string> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    
+    // Add auth header if API key is available
+    if (HF_API_KEY) {
+      headers["Authorization"] = `Bearer ${HF_API_KEY}`;
+    }
+
+    const response = await fetch(`${HF_API_URL}${HF_MODEL}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 1000,
+          temperature: 0.7,
+          top_p: 0.95,
+          return_full_text: false,
+        },
+      }),
+    });
+    console.log("HF_API_KEY currently =", HF_API_KEY ? "[set]" : "[missing]");
+    if (!response.ok) {
+      const errorData = await response.text();
+      console.error("Hugging Face API error:", response.status, errorData);
+      throw new Error(`Hugging Face API error: ${response.statusText}. ${errorData}`);
+    }
+
+    const data = await response.json();
+    
+    // Handle loading model response
+    if (data.error?.includes('loading')) {
+      throw new Error('AI model is loading. Please try again in a few moments.');
+    }
+    
+    return data[0]?.generated_text || "";
+  } catch (error) {
+    console.error("Hugging Face API error:", error);
+    throw error;
+  }
+}
+
+function parseAIResponse(response: string): AIGoalBreakdownResponse {
+  try {
+    // Try to extract JSON from the response
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    
+    // Fallback: create a structured response from the text
+    const lines = response.split('\n').filter(l => l.trim());
+    return {
+      projectTitle: lines[0] || "New Project",
+      projectDescription: lines.slice(1, 3).join(' ') || "AI-generated project",
+      tasks: lines.slice(3).map((line, idx) => ({
+        title: line.replace(/^[-•*]\s*/, ''),
+        description: `Task ${idx + 1} details`,
+        priority: idx === 0 ? 'high' : 'medium',
+        estimatedHours: Math.ceil(Math.random() * 8),
+        tags: [],
+      })).slice(0, 10),
+    };
+  } catch (error) {
+    console.error("Error parsing AI response:", error);
+    // Return a sensible default
+    return {
+      projectTitle: "Project Plan",
+      projectDescription: "AI-generated project breakdown",
+      tasks: [
+        {
+          title: "Define project requirements",
+          description: "Gather and document all requirements",
+          priority: "high",
+          estimatedHours: 4,
+          tags: ["planning"],
+        },
+        {
+          title: "Create project structure",
+          description: "Set up the basic project architecture",
+          priority: "high",
+          estimatedHours: 3,
+          tags: ["setup"],
+        },
+        {
+          title: "Implement core features",
+          description: "Build the main functionality",
+          priority: "medium",
+          estimatedHours: 8,
+          tags: ["development"],
+        },
+      ],
+    };
+  }
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Error handler helper
+  const handleError = (res: any, error: any) => {
+    if (error instanceof ZodError) {
+      return res.status(400).json({ error: "Validation error", details: error.errors });
+    }
+    console.error("API Error:", error);
+    return res.status(500).json({ error: error.message || "Internal server error" });
+  };
+
+  // Projects endpoints
+  app.get("/api/projects", async (req, res) => {
+    try {
+      const projects = await storage.getProjects();
+      res.json(projects);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/projects/:id", async (req, res) => {
+    try {
+      const project = await storage.getProject(req.params.id);
+      if (!project) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      res.json(project);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/projects", async (req, res) => {
+    try {
+      const validatedData = insertProjectSchema.parse(req.body);
+      const project = await storage.createProject(validatedData);
+      
+      // Check for achievements
+      const achievements = await storage.checkAndUnlockAchievements('default_user');
+      
+      res.status(201).json({ project, achievements });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.patch("/api/projects/:id", async (req, res) => {
+    try {
+      const validatedData = updateProjectSchema.parse(req.body);
+      const project = await storage.updateProject(req.params.id, validatedData);
+      if (!project) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      res.json(project);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.delete("/api/projects/:id", async (req, res) => {
+    try {
+      const success = await storage.deleteProject(req.params.id);
+      if (!success) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Tasks endpoints
+  app.get("/api/tasks", async (req, res) => {
+    try {
+      const projectId = req.query.projectId as string | undefined;
+      const tasks = await storage.getTasks(projectId);
+      res.json(tasks);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.get("/api/tasks/:id", async (req, res) => {
+    try {
+      const task = await storage.getTask(req.params.id);
+      if (!task) {
+        return res.status(404).json({ error: "Task not found" });
+      }
+      res.json(task);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.post("/api/tasks", async (req, res) => {
+    try {
+      const validatedData = insertTaskSchema.parse(req.body);
+      const task = await storage.createTask(validatedData);
+      
+      // Check for achievements
+      const achievements = await storage.checkAndUnlockAchievements('default_user');
+      
+      res.status(201).json({ task, achievements });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.patch("/api/tasks/:id", async (req, res) => {
+    try {
+      const validatedData = updateTaskSchema.parse(req.body);
+      const task = await storage.updateTask(req.params.id, validatedData);
+      if (!task) {
+        return res.status(404).json({ error: "Task not found" });
+      }
+      
+      // Check for achievements
+      const achievements = await storage.checkAndUnlockAchievements('default_user');
+      
+      res.json({ task, achievements });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.delete("/api/tasks/:id", async (req, res) => {
+    try {
+      const success = await storage.deleteTask(req.params.id);
+      if (!success) {
+        return res.status(404).json({ error: "Task not found" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // AI Goal Breakdown endpoint
+  app.post("/api/ai/goal-breakdown", async (req, res) => {
+    try {
+      const validatedData = aiGoalBreakdownRequestSchema.parse(req.body);
+      
+      // Check if HF API key is configured
+      if (!HF_API_KEY) {
+        return res.status(400).json({
+          error: "Hugging Face API key not configured",
+          message: "To use AI features, please add your free Hugging Face API key as a secret named 'HF_API_KEY' or 'HUGGINGFACE_API_KEY'. Get one at: https://huggingface.co/settings/tokens",
+        });
+      }
+      
+      // Construct prompt for AI
+      const prompt = `You are a project management AI assistant. Break down the following goal into a structured project plan with actionable tasks.
+
+Goal: ${validatedData.goal}
+${validatedData.context ? `Context: ${validatedData.context}` : ''}
+
+Provide a response in the following JSON format:
+{
+  "projectTitle": "Title of the project",
+  "projectDescription": "Brief description",
+  "tasks": [
+    {
+      "title": "Task title",
+      "description": "Task description",
+      "priority": "high|medium|low",
+      "estimatedHours": number,
+      "tags": ["tag1", "tag2"]
+    }
+  ]
+}
+
+Generate 5-10 specific, actionable tasks with clear deliverables.`;
+
+      // Call Hugging Face API
+      const aiResponse = await callHuggingFaceAPI(prompt);
+      const breakdown = parseAIResponse(aiResponse);
+      
+      res.json(breakdown);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Create project from AI breakdown
+  app.post("/api/ai/create-project", async (req, res) => {
+    try {
+      const { breakdown } = req.body;
+      
+      // Create project
+      const project = await storage.createProject({
+        title: breakdown.projectTitle,
+        description: breakdown.projectDescription,
+        status: 'active',
+        priority: 'medium',
+        progress: 0,
+      });
+
+      // Create tasks
+      const taskPromises = breakdown.tasks.map((task: any, index: number) =>
+        storage.createTask({
+          projectId: project.id,
+          title: task.title,
+          description: task.description,
+          status: 'backlog',
+          priority: task.priority || 'medium',
+          estimatedHours: task.estimatedHours,
+          tags: task.tags || [],
+          order: index,
+        })
+      );
+      
+      const tasks = await Promise.all(taskPromises);
+      
+      // Check for achievements
+      const achievements = await storage.checkAndUnlockAchievements('default_user');
+      
+      res.status(201).json({ project, tasks, achievements });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Achievements endpoints
+  app.get("/api/achievements", async (req, res) => {
+    try {
+      const achievements = await storage.getAchievements('default_user');
+      res.json(achievements);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Activities endpoint
+  app.get("/api/activities", async (req, res) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
+      const activities = await storage.getActivities(limit);
+      res.json(activities);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Settings endpoints
+  app.get("/api/settings", async (req, res) => {
+    try {
+      let settings = await storage.getSettings('default_user');
+      if (!settings) {
+        // Create default settings if none exist
+        settings = await storage.updateSettings('default_user', {
+          theme: 'dark-gradient',
+          aiProvider: 'huggingface',
+          tutorialCompleted: false,
+        });
+      }
+      res.json(settings);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  app.patch("/api/settings", async (req, res) => {
+    try {
+      const validatedData = updateSettingsSchema.parse(req.body);
+      const settings = await storage.updateSettings('default_user', validatedData);
+      res.json(settings);
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  // Analytics endpoint
+  app.get("/api/analytics", async (req, res) => {
+    try {
+      const projects = await storage.getProjects();
+      const tasks = await storage.getTasks();
+      const achievements = await storage.getAchievements('default_user');
+
+      const completedTasks = tasks.filter(t => t.status === 'done').length;
+      const inProgressTasks = tasks.filter(t => t.status === 'in_progress').length;
+      const totalTasks = tasks.length;
+      const completionRate = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+      res.json({
+        totalProjects: projects.length,
+        activeProjects: projects.filter(p => p.status === 'active').length,
+        totalTasks,
+        completedTasks,
+        inProgressTasks,
+        completionRate,
+        totalAchievements: achievements.length,
+      });
+    } catch (error) {
+      handleError(res, error);
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}
